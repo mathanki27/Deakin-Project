@@ -1,0 +1,918 @@
+---
+title: "Protein Signatures as Biomarkers for Cardiovascular Disease in HIV Patients"
+author: "Mathanki Mehra"
+date: "2026-03-23"
+output: html_document
+---
+
+## 1. Installing Packages
+
+```{r install-packages, eval=FALSE}
+install.packages(c("tidyverse","readr","janitor","pheatmap","ggplot2"))
+install.packages("BiocManager")
+install.packages(c("igraph", "ggraph", "tidygraph"))
+BiocManager::install(c("limma","clusterProfiler","org.Hs.eg.db","umap"))
+BiocManager::install("ReactomePA")
+
+```
+
+## 2.Load all R libraries needed for data processing and visualization.
+```{r load-libraries}
+library(BiocManager)
+library(dplyr)
+library(tidyverse)
+library(readr)
+library(janitor)
+library(limma)
+library(pheatmap)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(umap)
+library(ReactomePA)
+library(tibble)
+library(knitr)
+library(mitch)
+library(stringr)
+library(msigdbr)
+library(eulerr)
+library(beeswarm)
+```
+
+## 3. Load files
+
+```{r load-files}
+setwd("/mnt/data/mathanki/CVD_TMT")
+
+plexA <- read_tsv("abundance_protein_MD_plexA_new.tsv")
+plexB <- read_tsv("abundance_protein_MD_plexB_new.tsv")
+
+plexA <- janitor::clean_names(plexA)
+plexB <- janitor::clean_names(plexB)
+
+```
+
+## 4. Keep relevant columns
+
+```{r keep-columns}
+plexA <- dplyr::select(plexA, protein, gene,
+                       x126, x127n, x127c, x128n, x128c,
+                       x129n, x129c, x130n, x130c,
+                       x131n, x131c, x132n)
+
+plexB <- dplyr::select(plexB, protein, gene,
+                       x126, x127n, x127c, x128n, x128c,
+                       x129n, x129c, x130n, x130c,
+                       x131n, x131c, x132n)
+```
+
+## 5. Rename TMT channels to sample IDs
+
+```{r rename-channels}
+annotationA <- c(
+  x126="19191", x127n="34629", x127c="34862",
+  x128n="40431", x128c="40475", x129n="35038",
+  x129c="34866", x130n="41436", x130c="41383",
+  x131n="40316", x131c="3746", x132n="102953"
+)
+
+annotationB <- c(
+  x126="40797", x127n="4177", x127c="103376",
+  x128n="47542", x128c="47442", x129n="42977",
+  x129c="43081", x130n="113835", x130c="113856",
+  x131n="19584", x131c="118117", x132n="118008"
+)
+
+colnames(plexA)[match(names(annotationA), colnames(plexA))] <- annotationA
+colnames(plexB)[match(names(annotationB), colnames(plexB))] <- annotationB
+
+```
+
+## 6. Merge plexes
+
+```{r merge-plexes}
+merged <- full_join(plexA, plexB, by=c("protein","gene"))
+head(merged)
+```
+
+## 7. Expression matrix for Merged plexes, Plex A and Plex B
+
+```{r create-matrix}
+expr_combined <- as.data.frame(merged)
+protein_info_combined <- expr_combined[, c("protein", "gene")]
+rownames(expr_combined) <- expr_combined$protein
+expr_combined <- expr_combined[, !(colnames(expr_combined) %in% c("protein","gene"))]
+expr_combined <- as.matrix(expr_combined)
+storage.mode(expr_combined) <- "numeric"
+
+expr_A <- as.data.frame(plexA)
+protein_info_A <- expr_A[, c("protein", "gene")]
+rownames(expr_A) <- expr_A$protein
+expr_A <- expr_A[, !(colnames(expr_A) %in% c("protein","gene"))]
+expr_A <- as.matrix(expr_A)
+storage.mode(expr_A) <- "numeric"
+head(expr_A)
+
+expr_B <- as.data.frame(plexB)
+protein_info_B <- expr_B[, c("protein", "gene")]
+rownames(expr_B) <- expr_B$protein
+expr_B <- expr_B[, !(colnames(expr_B) %in% c("protein","gene"))]
+expr_B <- as.matrix(expr_B)
+storage.mode(expr_B) <- "numeric"
+head(expr_B)
+
+```
+
+## 8. Filter proteins (present in >=50% of samples)
+
+```{r}
+keep_combined <- rowSums(!is.na(expr_combined)) >= ncol(expr_combined)*0.5
+expr_combined_filt <- expr_combined[keep_combined, ]
+
+keep_A <- rowSums(!is.na(expr_A)) >= ncol(expr_A)*0.5
+expr_A_filt <- expr_A[keep_A, ]
+
+
+keep_B <- rowSums(!is.na(expr_B)) >= ncol(expr_B)*0.5
+expr_B_filt <- expr_B[keep_B, ]
+
+```
+
+
+## 9. QC before normalization
+
+```{r qc-pre-normalization}
+qc_sample_combined <- data.frame(
+  Sample = colnames(expr_combined_filt),
+  Detected_Proteins = colSums(!is.na(expr_combined_filt)),
+  Missing_Percent = colMeans(is.na(expr_combined_filt)) * 100,
+  Median_Intensity = apply(expr_combined_filt, 2, median, na.rm = TRUE),
+  SD_Intensity = apply(expr_combined_filt, 2, sd, na.rm = TRUE)
+)
+
+# Assign plex
+plexA_samples <- c(
+  "19191","34629","34862","40431","40475","35038",
+  "34866","41436","41383","40316","3746","102953"
+)
+
+qc_sample_combined$Plex <- ifelse(qc_sample_combined$Sample %in% plexA_samples, "A", "B")
+
+# QC summary by plex
+qc_plex_combined <- qc_sample_combined %>%
+  group_by(Plex) %>%
+  summarise(
+    N_Samples = n(),
+    Mean_Detected_Proteins = mean(Detected_Proteins),
+    Mean_Missing_Percent = mean(Missing_Percent),
+    Mean_Median_Intensity = mean(Median_Intensity),
+    .groups = "drop"
+  )
+
+
+kable(qc_sample_combined)
+kable(qc_plex_combined)
+
+
+# QC plots
+qc_long_combined <- as.data.frame(expr_combined_filt) %>%
+  rownames_to_column("Protein") %>%
+  pivot_longer(-Protein, names_to = "Sample", values_to = "Intensity") %>%
+  filter(is.finite(Intensity))
+
+# Missingness plot
+ggplot(qc_sample_combined,
+       aes(x = reorder(Sample, Missing_Percent),
+           y = Missing_Percent,
+           fill = Plex)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(title = "Missingness per Sample",
+       x = "Sample", y = "% Missing")
+
+# Detected proteins plot
+ggplot(qc_sample_combined,
+       aes(x = reorder(Sample, Detected_Proteins),
+           y = Detected_Proteins,
+           fill = Plex)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(title = "Detected Proteins per Sample",
+       x = "Sample", y = "Detected Proteins")
+
+# Density plot
+ggplot(qc_long_combined,
+       aes(x = Intensity, color = Sample)) +
+  geom_density(linewidth = 0.8) +
+  theme_bw() +
+  labs(title = "Pre-Normalization Intensity Distribution Graph",
+       x = "Intensity", y = "Density")
+
+
+# Plex-level comparison
+ggplot(qc_plex_combined,
+       aes(x = Plex, y = Mean_Detected_Proteins, fill = Plex)) +
+  geom_col() +
+  theme_bw() +
+  labs(title = "Mean Detected Proteins by Plex",
+       x = "Plex", y = "Mean Detected Proteins")
+
+```
+
+## 10. Quantile normalization and log2 transform
+
+```{r}
+expr_combined_norm <- normalizeBetweenArrays(expr_combined_filt, method = "quantile")
+expr_combined_log <- log2(expr_combined_norm + 1)
+boxplot(expr_combined_log, main = "Post-Normalization for both plexes", las = 2)
+
+# Plex A
+expr_A_norm <- normalizeBetweenArrays(expr_A_filt, method = "quantile")
+expr_A_log <- log2(expr_A_norm + 1)
+boxplot(expr_A_log, main = "Post-Normalization for Plex A", las = 2)
+
+# plex B
+expr_B_norm <- normalizeBetweenArrays(expr_B_filt, method = "quantile")
+expr_B_log <- log2(expr_B_norm + 1)
+boxplot(expr_B_log, main = "Post-Normalization for Plex B", las = 2)
+```
+
+## 11. QC after normalization
+
+```{r qc-post-normalization}
+qc_long_norm_combined <- as.data.frame(expr_combined_log) %>%
+  rownames_to_column("Protein") %>%
+  pivot_longer(-Protein, names_to = "Sample", values_to = "Intensity") %>%
+  filter(is.finite(Intensity))
+
+ggplot(qc_long_norm_combined,
+       aes(x = Intensity, color = Sample)) +
+  geom_density(linewidth = 0.8) +
+  theme_bw() +
+  labs(title = "Post-Normalization Intensity Distribution Graph",
+       x = "Log2 Intensity",
+       y = "Density")
+cor_post_combined <- cor(expr_combined_log, use = "pairwise.complete.obs")
+
+```
+
+## 12. Impute missing values (median)
+
+```{r}
+# Combine Plexes
+expr_combined_imp <- expr_combined_log
+for(i in 1:ncol(expr_combined_imp)){
+  expr_combined_imp[is.na(expr_combined_imp[,i]), i] <- 
+    median(expr_combined_imp[,i], na.rm = TRUE)
+}
+
+# Plex A
+expr_A_imp <- expr_A_log
+
+for(i in 1:ncol(expr_A_imp)){
+  expr_A_imp[is.na(expr_A_imp[,i]), i] <- 
+    median(expr_A_imp[,i], na.rm = TRUE)
+}
+
+# Plex B
+expr_B_imp <- expr_B_log
+
+for(i in 1:ncol(expr_B_imp)){
+  expr_B_imp[is.na(expr_B_imp[,i]), i] <- 
+    median(expr_B_imp[,i], na.rm = TRUE)
+}
+sum(is.na(expr_combined_imp))
+sum(is.na(expr_A_imp))
+sum(is.na(expr_B_imp))
+
+# Removing Zero Variance Proteins
+expr_combined_imp <- expr_combined_imp[apply(expr_combined_imp, 1, var) != 0, ]
+expr_A_imp <- expr_A_imp[apply(expr_A_imp, 1, var) != 0, ]
+expr_B_imp <- expr_B_imp[apply(expr_B_imp, 1, var) != 0, ]
+```
+
+## Metadata Creation
+
+```{r}
+
+# METADATA CREATION (SINGLE SOURCE OF TRUTH)
+
+# Create combined metadata from expression matrix
+meta_combined <- data.frame(
+  Sample = colnames(expr_combined_imp)
+)
+
+# Define Plex (based on known Plex A samples)
+
+plexA_samples <- c(
+  "19191","34629","34862","40431","40475","35038",
+  "34866","41436","41383","40316","3746","102953"
+)
+
+meta_combined$Plex <- ifelse(meta_combined$Sample %in% plexA_samples,
+                             "A", "B")
+
+meta_combined$Plex <- factor(meta_combined$Plex)
+
+
+# Define biological group (Case vs Control)
+
+
+case_samples <- c(
+  "19191","40797","34862","103376","40475","47442",
+  "34866","43081","41383","113856","3746","118117"
+)
+
+meta_combined$Group <- ifelse(meta_combined$Sample %in% case_samples,
+                              "Case", "Control")
+
+meta_combined$Group <- factor(meta_combined$Group,
+                              levels = c("Control","Case"))
+
+
+# Final formatting
+
+
+rownames(meta_combined) <- meta_combined$Sample
+
+
+# Create Plex-specific metadata (CORRECT WAY)
+
+
+meta_A <- meta_combined[meta_combined$Plex == "A", ]
+meta_B <- meta_combined[meta_combined$Plex == "B", ]
+
+
+# Align with expression matrices 
+
+meta_A <- meta_A[colnames(expr_A_imp), ]
+meta_B <- meta_B[colnames(expr_B_imp), ]
+
+# Keep only needed columns
+
+
+meta_A <- meta_A[, c("Sample","Group")]
+meta_B <- meta_B[, c("Sample","Group")]
+
+# SANITY CHECKS
+
+# Alignment
+all(rownames(meta_A) == colnames(expr_A_imp))
+all(rownames(meta_B) == colnames(expr_B_imp))
+all(rownames(meta_combined) == colnames(expr_combined_imp))
+
+# Distribution checks
+table(meta_combined$Plex, meta_combined$Group)
+table(meta_A$Group)
+table(meta_B$Group)
+```
+
+## PCA Before Batch Correction for combined plexes
+
+```{r}
+# PCA before batch correction
+pca_pre <- prcomp(t(expr_combined_imp), center = TRUE, scale. = TRUE)
+
+# Variance explained
+percentVar_pre <- round(100 * (pca_pre$sdev^2 / sum(pca_pre$sdev^2)), 1)
+
+# PCA dataframe
+pca_df_pre <- data.frame(
+  PC1 = pca_pre$x[,1],
+  PC2 = pca_pre$x[,2],
+  Sample = colnames(expr_combined_imp),
+  Plex = meta_combined$Plex,
+  Group = meta_combined$Group
+)
+
+# Plot
+ggplot(pca_df_pre,
+       aes(x = PC1, y = PC2,
+           color = Plex,
+           shape = Group)) +
+  geom_point(size = 4) +
+  geom_text(aes(label = Sample),
+            vjust = -0.8,
+            size = 3,
+            show.legend = FALSE) +
+  theme_bw() +
+  labs(
+    title = "PCA Before Batch Correction",
+    x = paste0("PC1 (", percentVar_pre[1], "%)"),
+    y = paste0("PC2 (", percentVar_pre[2], "%)")
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+## Batch Correction
+
+```{r}
+expr_combined_corrected <- removeBatchEffect(
+  expr_combined_imp,
+  batch = meta_combined$Plex,
+  design = model.matrix(~ Group, data = meta_combined)
+)
+
+# Quick check
+head(expr_combined_corrected[,1:5])
+# Dimensions unchanged
+dim(expr_combined_corrected)
+```
+
+## PCA On Combined Plexes after removing Batch effect
+
+```{r}
+# PCA after batch correction
+pca_post <- prcomp(t(expr_combined_corrected), center = TRUE, scale. = TRUE)
+
+# Variance explained
+percentVar_post <- round(100 * (pca_post$sdev^2 / sum(pca_post$sdev^2)), 1)
+
+# PCA dataframe
+pca_df_post <- data.frame(
+  PC1 = pca_post$x[,1],
+  PC2 = pca_post$x[,2],
+  Sample = colnames(expr_combined_corrected),
+  Plex = meta_combined$Plex,
+  Group = meta_combined$Group
+)
+
+# Plot
+ggplot(pca_df_post,
+       aes(x = PC1, y = PC2,
+           color = Group,
+           shape = Plex)) +
+  geom_point(size = 4) +
+  geom_text(aes(label = Sample),
+            vjust = -0.8,
+            size = 3,
+            show.legend = FALSE) +
+  theme_bw() +
+  labs(
+    title = "PCA After Batch Correction",
+    x = paste0("PC1 (", percentVar_post[1], "%)"),
+    y = paste0("PC2 (", percentVar_post[2], "%)")
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+```{r hierarchical-clustering-heatmap, fig.width=8, fig.height=7}
+
+library(pheatmap)
+
+# Sample correlation matrix
+cor_matrix <- cor(expr_combined_corrected,
+                  use = "pairwise.complete.obs")
+
+# Sample annotations
+annotation_df <- data.frame(
+  Plex = meta_combined$Plex,
+  Group = meta_combined$Group
+)
+
+rownames(annotation_df) <- colnames(expr_combined_corrected)
+
+# Heatmap with hierarchical clustering
+pheatmap(
+  cor_matrix,
+  annotation_col = annotation_df,
+  annotation_row = annotation_df,
+  clustering_method = "complete",
+  main = "Hierarchical Clustering of Samples",
+  fontsize = 10,
+  border_color = NA
+)
+```
+
+
+
+## Differential Expression Analysis
+```{r}
+# 1. PLEX A
+design_A <- model.matrix(~ Group, data = meta_A)
+fit_A <- lmFit(expr_A_imp, design_A)
+fit_A <- eBayes(fit_A)
+results_A <- topTable(
+  fit_A,
+  coef = "GroupCase",
+  number = Inf,
+  sort.by = "P"
+)
+results_A$Protein <- rownames(results_A)
+# Add gene annotation
+results_A <- merge(
+  results_A,
+  protein_info_A,
+  by.x = "Protein",
+  by.y = "protein",
+  all.x = TRUE
+)
+# Add significance labels
+results_A$Significance <- "Not Significant"
+results_A$Significance[
+  results_A$adj.P.Val < 0.05 & results_A$logFC > 1
+] <- "Upregulated"
+results_A$Significance[
+  results_A$adj.P.Val < 0.05 & results_A$logFC < -1
+] <- "Downregulated"
+# View
+head(results_A)
+
+# 2. PLEX B
+design_B <- model.matrix(~ Group, data = meta_B)
+fit_B <- lmFit(expr_B_imp, design_B)
+fit_B <- eBayes(fit_B)
+results_B <- topTable(
+  fit_B,
+  coef = "GroupCase",
+  number = Inf,
+  sort.by = "P"
+)
+results_B$Protein <- rownames(results_B)
+# Add gene annotation
+results_B <- merge(
+  results_B,
+  protein_info_B,
+  by.x = "Protein",
+  by.y = "protein",
+  all.x = TRUE
+)
+# Add significance labels
+results_B$Significance <- "Not Significant"
+results_B$Significance[
+  results_B$adj.P.Val < 0.05 & results_B$logFC > 1
+] <- "Upregulated"
+results_B$Significance[
+  results_B$adj.P.Val < 0.05 & results_B$logFC < -1
+] <- "Downregulated"
+# View
+head(results_B)
+
+
+# 3. Combined Plex
+design_combined <- model.matrix(~ Plex + Group, data = meta_combined)
+fit_combined <- lmFit(expr_combined_imp, design_combined)
+fit_combined <- eBayes(fit_combined)
+results_combined <- topTable(
+  fit_combined,
+  coef = "GroupCase",
+  number = Inf,
+  sort.by = "P"
+)
+results_combined$Protein <- rownames(results_combined)
+# Add gene annotation
+results_combined <- merge(
+  results_combined,
+  protein_info_combined,
+  by.x = "Protein",
+  by.y = "protein",
+  all.x = TRUE
+)
+# Add significance labels
+results_combined$Significance <- "Not Significant"
+
+results_combined$Significance[
+  results_combined$adj.P.Val < 0.05 & results_combined$logFC > 1
+] <- "Upregulated"
+results_combined$Significance[
+  results_combined$adj.P.Val < 0.05 & results_combined$logFC < -1
+] <- "Downregulated"
+# View
+head(results_combined)
+```
+
+## Overlap Of top 50 Up and down regulated genes for plex A and Plex B.
+
+```{r}
+# Plex A - Top 50 UP
+top_A_up <- results_A %>%
+  dplyr::arrange(P.Value) %>%
+  dplyr::filter(logFC > 0) %>%
+  dplyr::slice_head(n = 50)
+
+# Plex A - Top 50 DOWN
+top_A_down <- results_A %>%
+  dplyr::arrange(P.Value) %>%
+  dplyr::filter(logFC < 0) %>%
+  dplyr::slice_head(n = 50)
+
+# Plex B - Top 50 UP
+top_B_up <- results_B %>%
+  dplyr::arrange(P.Value) %>%
+  dplyr::filter(logFC > 0) %>%
+  dplyr::slice_head(n = 50)
+
+# Plex B - Top 50 DOWN
+top_B_down <- results_B %>%
+  dplyr::arrange(P.Value) %>%
+  dplyr::filter(logFC < 0) %>%
+  dplyr::slice_head(n = 50)
+
+A_up <- top_A_up$Protein
+A_down <- top_A_down$Protein
+
+B_up <- top_B_up$Protein
+B_down <- top_B_down$Protein
+
+shared_up <- intersect(A_up, B_up)
+unique_A_up <- setdiff(A_up, B_up)
+unique_B_up <- setdiff(B_up, A_up)
+
+shared_down <- intersect(A_down, B_down)
+unique_A_down <- setdiff(A_down, B_down)
+unique_B_down <- setdiff(B_down, A_down)
+
+cat("UP overlap:\n")
+cat("Shared:", length(shared_up), "\n")
+cat("Unique A:", length(unique_A_up), "\n")
+cat("Unique B:", length(unique_B_up), "\n\n")
+
+cat("DOWN overlap:\n")
+cat("Shared:", length(shared_down), "\n")
+cat("Unique A:", length(unique_A_down), "\n")
+cat("Unique B:", length(unique_B_down), "\n")
+
+fit_up <- euler(c(
+  "Plex A" = length(A_up),
+  "Plex B" = length(B_up),
+  "Plex A&Plex B" = length(shared_up)
+))
+
+plot(fit_up,
+     fills = c("#1f77b4", "#ff7f0e"),
+     labels = TRUE,
+     main = "Top 50 Upregulated Proteins Overlap")
+
+fit_down <- euler(c(
+  "Plex A" = length(A_down),
+  "Plex B" = length(B_down),
+  "Plex A&Plex B" = length(shared_down)
+))
+
+plot(fit_down,
+     fills = c("#2ca02c", "#d62728"),
+     labels = TRUE,
+     main = "Top 50 Downregulated Proteins Overlap")
+```
+
+
+## Volcano plot
+
+```{r volcano-combined-blue-white-red, fig.width=8, fig.height=6}
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+# Prepare volcano plot data
+volcano_combined <- results_combined %>%
+  mutate(
+    negLog10P = -log10(P.Value),
+    Label = ifelse(rank(P.Value, ties.method = "first") <= 10, gene, NA)
+  )
+
+# Volcano plot with blue-white-red scale
+ggplot(volcano_combined,
+       aes(x = logFC, y = negLog10P, fill = logFC)) +
+  geom_point(
+    shape = 21,
+    color = "black",
+    stroke = 0.2,
+    alpha = 0.85,
+    size = 2.5
+  ) +
+  geom_vline(
+    xintercept = c(-1, 1),
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+  geom_text_repel(
+    aes(label = Label),
+    size = 3,
+    max.overlaps = 20,
+    na.rm = TRUE
+  ) +
+  scale_fill_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red",
+    midpoint = 0,
+    name = "log2 Fold Change"
+  ) +
+  theme_bw() +
+  labs(
+    title = "Differential Protein Abundance in Combined Plex Dataset",
+    x = "log2 Fold Change",
+    y = "-log10(P-value)"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+
+## Top 50 up and down regulated proteins in combined plex.
+
+```{r}
+# Combined Plex - Top 50 UP
+top_combined_up <- results_combined %>%
+  dplyr::arrange(P.Value) %>%
+  dplyr::filter(logFC > 0) %>%
+  dplyr::slice_head(n = 50)
+
+# Combined Plex - Top 50 DOWN
+top_combined_down <- results_combined %>%
+  dplyr::arrange(P.Value) %>%
+  dplyr::filter(logFC < 0) %>%
+  dplyr::slice_head(n = 50)
+
+# View tables
+kable(
+  top_combined_up,
+  caption = "Top 50 Upregulated Proteins in Combined Plex"
+)
+
+kable(
+  top_combined_down,
+  caption = "Top 50 Downregulated Proteins in Combined Plex"
+)
+```
+
+
+## Combined Plex Pathway Enrichment Analysis
+```{r}
+
+# Combined Plex
+
+rank_combined <- results_combined %>%
+  dplyr::select(gene, t) %>%
+  filter(!is.na(gene)) %>%
+  group_by(gene) %>%
+  summarise(t = mean(t), .groups = "drop") %>%
+  arrange(desc(t))
+
+# Get gene sets (Reactome)
+msig_reactome <- msigdbr(
+  species = "Homo sapiens",
+  category = "C2",
+  subcategory = "CP:REACTOME"
+)
+
+reactome_sets <- split(msig_reactome$gene_symbol,
+                       msig_reactome$gs_name)
+
+gene_list_combined <- rank_combined$t
+names(gene_list_combined) <- rank_combined$gene
+
+df_combined <- data.frame(logFC = gene_list_combined)
+
+mitch_combined_reactome <- mitch_calc(
+  df_combined,
+  reactome_sets,
+  minsetsize = 5
+)
+
+res_combined_reactome <- 
+  mitch_combined_reactome$enrichment_result %>%
+  arrange(p.adjustANOVA)
+
+head(res_combined_reactome, 20)
+
+unlink("mitchreport.html")
+mitch_report(mitch_combined_reactome,"mitchreport.html")
+
+```
+
+
+
+## Figure
+```{r reactome-dotplot, fig.width=10, fig.height=8}
+
+library(ggplot2)
+library(dplyr)
+
+top_pathways <- res_combined_reactome %>%
+  dplyr::select(set, setSize, pANOVA, s.dist, p.adjustANOVA) %>%
+  arrange(p.adjustANOVA) %>%
+  head(20)
+
+top_pathways$set <- gsub("REACTOME_", "", top_pathways$set)
+top_pathways$set <- gsub("_", " ", top_pathways$set)
+
+ggplot(top_pathways,
+       aes(x = s.dist,
+           y = reorder(set, s.dist),
+           size = setSize,
+           color = p.adjustANOVA)) +
+  geom_point(alpha = 0.9) +
+  scale_color_gradient(
+    low = "red",
+    high = "blue",
+    name = "Adjusted p-value"
+  ) +
+  theme_bw() +
+  labs(
+    title = "Top Enriched Reactome Pathways in Combined Plex",
+    x = "Enrichment Score Distance",
+    y = "Reactome Pathway",
+    size = "Pathway Size"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.y = element_text(size = 9),
+    axis.title = element_text(face = "bold")
+  )
+
+```
+
+
+
+## more figure
+```{r pathway-network-plot, fig.width=10, fig.height=8}
+
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(dplyr)
+
+# Select top pathways
+network_df <- res_combined_reactome %>%
+  arrange(p.adjustANOVA) %>%
+  head(15)
+
+# Clean names
+network_df$set <- gsub("REACTOME_", "", network_df$set)
+network_df$set <- gsub("_", " ", network_df$set)
+
+# Create artificial pathway similarity edges
+# (based on ranking adjacency for visualisation)
+
+edges <- data.frame(
+  from = network_df$set[-nrow(network_df)],
+  to = network_df$set[-1]
+)
+
+# Create graph
+graph <- graph_from_data_frame(edges, directed = FALSE)
+
+# Add node attributes
+V(graph)$pvalue <- network_df$p.adjustANOVA
+V(graph)$size <- network_df$setSize
+
+# Plot network
+ggraph(graph, layout = "fr") +
+
+  geom_edge_link(alpha = 0.5, colour = "grey70") +
+
+  geom_node_point(aes(size = size,
+                      color = pvalue)) +
+
+  geom_node_text(aes(label = name),
+                 repel = TRUE,
+                 size = 3) +
+
+  scale_color_gradient(
+    low = "red",
+    high = "blue",
+    name = "Adjusted p-value"
+  ) +
+
+  theme_void() +
+
+  labs(
+    title = "Reactome Pathway Network",
+    size = "Pathway Size"
+  ) +
+
+  theme(
+    plot.title = element_text(hjust = 0.5,
+                              face = "bold",
+                              size = 14)
+  )
+
+```
+
+
+
+
+
+
+
+## Session Info
+```{r}
+sessionInfo()
+save.image("Analysis3.rdata")
+```
