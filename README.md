@@ -31,9 +31,8 @@ The analytical workflow included:
 | analysis.Rmd | Main R Markdown analysis workflow |
 | analysis.html | Rendered report |
 | metadata.csv | Sample metadata |
-| DE_results.csv | Differential expression results |
-| pathway_results.csv | Reactome pathway enrichment results |
-| figures/ | PCA, volcano plots, enrichment figures |
+| mitch.html | Reactome pathway enrichment results |
+
 
 ## Key Findings
 
